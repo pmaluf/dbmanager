@@ -1,0 +1,301 @@
+#!/bin/bash
+#
+# dbmanager.sh
+# Created: Paulo Victor Maluf - 5/2015
+#
+# Parameters:
+#
+#   dbmanager.sh --help
+#
+#    Parameter             Short Description                                                        Default
+#    --------------------- ----- ------------------------------------------------------------------ --------------
+#    --master-sid             -m SID of database with will be cloned
+#    --clone-sid              -c SID of the new instance
+#    --drop-database          -d Delete the database 
+#    --list-databases         -l List the active databases
+#    --skip-recover           -s Skip recover database before open resetlogs                        FALSE
+#    --help                   -h help
+#
+#   Ex.: dbmanager.sh --master-sid BRM1 --clone-sid BRM2
+#        dbmanager.sh --drop-database BRM2
+#
+# Changelog:
+#
+# Date       Author               Description
+# ---------- ------------------- ----------------------------------------------------
+# 16/09/2015 Paulo Maluf         Add the persistendb.ini. Minor bugs fixed
+#====================================================================================
+
+################################
+# VARIAVEIS GLOBAIS            #
+################################
+export ORACLE_HOME="/u01/app/oracle/product/11.2.0/dbhome_1"
+export LD_LIBRARY_PATH=$ORACLE_HOME/lib:/lib:/usr/lib:/usr/local/lib:/usr/lib64
+export PATH=${PATH}:$ORACLE_HOME/bin:$ORACLE_HOME/OPatch:
+NLS_DATE_FORMAT="yyyy-mm-dd:hh24:mi:ss"
+SQLPLUS=`which sqlplus`
+RMAN=`which rman`
+PERL=`which perl`
+SED=`which sed`
+HOSTNAME=`hostname`
+SCRIPT=`readlink -f $0`
+BASENAME=`basename ${SCRIPT}`
+SCRIPTPATH=`dirname ${SCRIPT}`
+PLCLONE="${SCRIPTPATH}/bin/clone.pl"
+PFILE_TMP="${ORACLE_HOME}/dbs/initFAKE.ora"
+CLONE_DIR="/nfs_rw"
+RECOVER="TRUE"
+DROP="FALSE"
+LAST="${SCRIPTPATH}/logs/${BASENAME}.last"
+PERSISTENTDB="${SCRIPTPATH}/persistentdb.ini"
+
+################################
+# FUNCOES                      #
+################################
+help()
+{
+  head -21 $0 | tail -19
+  exit
+}
+
+sql()
+{
+sqlplus -s "/as sysdba" <<EOF
+set pages 0
+set define off;
+set feedback off;
+set lines 1000;
+set trimout on;
+${1}
+EOF
+}
+
+log (){
+ if [ "$1." == "0." ]; then
+   echo -ne " [ \e[40;32mOK\e[40;37m ]\n" | tee -a ${LAST}
+ elif [ "$1." == "1." ]; then
+   echo -ne " [ \e[40;31mNOK\e[40;37m ]\n" | tee -a ${LAST}
+   exit 1
+ elif [ "$1." == "2." ]; then
+   echo -ne " [ \e[40;33mNOK\e[40;37m ]\n" | tee -a ${LAST}
+ else
+     echo -ne "[`date '+%d%m%Y %T'`] $1" | tee -a ${LAST}
+ fi
+}
+
+spinner() {
+ local pid=$1
+ local delay=0.75
+ local spinstr='|/-\'
+ while [ "$(ps a | awk '{print $1}' | grep $pid)" ]; do
+     local temp=${spinstr#?}
+     printf " [%c]  " "$spinstr"
+     local spinstr=$temp${spinstr%"$temp"}
+     sleep $delay
+     printf "\b\b\b\b\b\b"
+ done
+ printf "    \b\b\b\b"
+}
+
+set_env() {
+ log "Setting enviroment variables..."
+ export ORACLE_SID=${CLONE_SID}
+ export MASTER_COPY_DIR=/nfs_ro/${MASTER_SID}
+ export CLONE_FILE_CREATE_DEST=/nfs_rw/${CLONE_SID}
+ export CLONEDB_NAME=${CLONE_SID}
+ log 0
+}
+
+create_dir(){
+ log "Creating clone dir(${CLONE_DIR}/${CLONE_SID})..."
+ mkdir -p ${CLONE_DIR}/${CLONE_SID}
+ [ "$?." == "0." ] && log 0 || log 1
+}
+
+plclone(){
+ log "Executing clone.pl..."
+ ${PERL} ${PLCLONE} ${PFILE_TMP} ${SCRIPTPATH}/tmp/crtdb.sql ${SCRIPTPATH}/tmp/dbren.sql > /dev/null 2>&1
+ [ "$?." == "0." ] && log 0 || log 1
+}
+
+startup(){
+ log "Starting instance ${CLONE_SID}..."
+ ( ${SQLPLUS} / as sysdba @${SCRIPTPATH}/tmp/crtdb.sql > /dev/null 2>&1
+   [ "$?." == "0." ] && log 0 || { log 1 ; exit 1 ;}
+ ) &
+ spinner $!
+}
+
+dbrename(){
+ log "Executing the clonedb_renamefile..."
+ (
+ ${SQLPLUS} / as sysdba @${SCRIPTPATH}/tmp/dbren.sql > /dev/null 2>&1
+ [ "$?." == "0." ] && log 0 || { log 1 ; exit 1 ; }
+ ) &
+ spinner $!
+}
+
+catalog(){
+ log "Cataloging archivelogs from /ro/archive/${MASTER_SID}..."
+ ARCHIVE_DIR="/ro/archive/${MASTER_SID}/"
+ ${RMAN} target / log=${SCRIPTPATH}/logs/catalog.log > /dev/null 2>&1 <<EOF
+RUN {
+ catalog start with '$ARCHIVE_DIR' noprompt;
+}
+EOF
+ [ "$?." == "0." ] && log 0 || log 1
+}
+
+recover(){
+ log "Gettting the SCN for a consistent recovery...\n"
+ SCN=`sql "select max(FHAFS) from X\\$KCVFH;"`
+ log "Recovering database, please wait this may take a few hours..."
+(
+${RMAN} target / log=${SCRIPTPATH}/logs/recover.log > /dev/null 2>&1 <<EOF
+RUN {
+ allocate channel ch1 type disk;
+ allocate channel ch2 type disk;
+ allocate channel ch3 type disk;
+ allocate channel ch4 type disk;
+ recover database until scn ${SCN};
+ release channel ch1;
+ release channel ch2;
+ release channel ch3;
+ release channel ch4;
+}
+EOF
+log 0
+) &
+spinner $!
+}
+
+openresetlogs(){
+ log "Open database resetlogs..."
+ ( 
+   sql "alter database open resetlogs;" 2> /dev/null 2>&1
+   [ "$?." == "0." ] && log 0 || { log 1 ; exit 1 ; } 
+ ) & 
+ spinner $!
+}
+
+createspfile(){
+ log "Creating spfile..."
+ sql "create spfile from memory;"
+ [ "$?." == "0." ] && log 0 || log 1
+}
+
+create_oenv(){
+ log "Creating oenv entry..."
+ echo "${CLONE_SID}:${ORACLE_HOME}:N" >> /etc/oenv
+ log 0
+}
+
+shutdown_database(){
+ PMON=`ps -ef | egrep "ora_pmon_${SID}$"|awk '{print $2}'`
+ export ORACLE_SID=${SID}
+ if [ ${PMON} ]
+  then
+    log "Shutting down the ${SID}..."
+    ( sql "shutdown immediate;" > /dev/null 2>&1
+      [ "$?." == "0." ] && log 0 || { log 1 ; exit 1 ;}
+    ) &
+    spinner $!
+  else
+    log "Database ${SID} is not started." ; log 2
+ fi
+}
+
+drop_database(){
+ if [ -d "${CLONE_DIR}/${SID}" ]
+  then
+    log "Deleting datafiles..."
+    (
+      rm -rf ${CLONE_DIR}/${SID} > /dev/null 2>&1
+      [ "$?." == "0." ] && log 0 || { log 1 ; exit 1 ;}
+    ) &
+    spinner $!
+
+    log "Deleting configfiles..."
+    rm -f ${ORACLE_HOME}/dbs/spfile${SID}.ora
+    rm -f ${ORACLE_HOME}/dbs/${SID}_bitmap.dbf
+    rm -f ${ORACLE_HOME}/dbs/hc_${SID}.dat
+    rm -f ${ORACLE_HOME}/dbs/lk${SID}
+    sudo ${SED} -i "/^${SID}/d" /etc/oenv
+    log 0
+  else
+    log "Directory "${CLONE_DIR}/${SID}" not found." ; log 1
+ fi
+}
+
+list_databases(){
+ for SID in `cat /etc/oenv | cut -d: -f1` 
+  do 
+    export ORACLE_SID=${SID} 
+    STATUS=`sql "select 'OK' from dual;"`
+    if [ "${STATUS}." == "OK." ] 
+     then
+       echo -ne "${SID} " ; log 0 
+     else
+       echo -ne "${SID} " ; log 2
+    fi
+  done
+  exit 0 
+}
+
+# Verifica se foi passado algum parametro
+[ "$1" ] || { help ; exit 1 ; }
+
+# Tratamento dos Parametros
+for arg
+do
+    delim=""
+    case "$arg" in
+    #translate --gnu-long-options to -g (short options)
+      --master-sid)         args="${args}-m ";;
+      --clone-sid)          args="${args}-c ";;
+      --skip-recover)       args="${args}-s ";;
+      --drop-database)      args="${args}-d ";;
+      --list-databases)     args="${args}-l ";;
+      --help)               args="${args}-h ";;
+      #pass through anything else
+      *) [[ "${arg:0:1}" == "-" ]] || delim="\""
+         args="${args}${delim}${arg}${delim} ";;
+    esac
+done
+
+eval set -- $args
+
+while getopts ":hc:sm:ld:" PARAMETRO
+do
+    case $PARAMETRO in
+        h) help;;
+        m) MASTER_SID=${OPTARG[@]};;
+        c) CLONE_SID=${OPTARG[@]};;
+        d) DROP="TRUE"; SID=${OPTARG[@]};;
+        l) list_databases;;
+        s) RECOVER="FALSE";;
+        :) echo "Option -$OPTARG requires an argument."; exit 1;;
+        *) echo $OPTARG is an unrecognized option ; echo $USAGE; exit 1;;
+    esac
+done
+
+if [ "${DROP}." == "TRUE." ]
+ then
+  if [ "`egrep -oc "^${SID}$" ${PERSISTENTDB}`." == "0." ] 
+   then
+    shutdown_database
+    drop_database
+   else
+    log "This database is persistent and cannot be droppped." ; log 1
+  fi
+ else
+   set_env
+   create_dir
+   plclone
+   startup
+   dbrename
+   [ "${RECOVER}." == "TRUE." ] && catalog && recover 
+   openresetlogs
+   createspfile
+   create_oenv
+fi

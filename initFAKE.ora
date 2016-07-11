@@ -1,0 +1,16 @@
+cluster_database=FALSE
+#_no_recovery_through_resetlogs=TRUE
+#_allow_resetlogs_corruption=true
+clonedb=true
+db_name=''
+memory_target=512M
+processes = 150
+audit_trail ='none'
+db_block_size=8192
+db_domain=''
+open_cursors=300
+remote_login_passwordfile='EXCLUSIVE'
+undo_tablespace='UNDOTBS1'
+control_files=''
+compatible ='11.2.0'
+recovery_parallelism=4
